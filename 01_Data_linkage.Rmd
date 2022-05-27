@@ -1,0 +1,1007 @@
+---
+title: "Linked line list data to variant classification and hospitalisation data"
+author: "Tommy Nyberg; Harriet Webster; Nurin Abdul Aziz"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+    html_document:
+        df_print: paged
+        code_folding: hide
+        toc:          true
+        toc_float:    true
+        number_sections: true
+    html_notebook:
+        code_folding: hide
+        toc:          true
+        toc_float:    true
+        number_sections: true
+---
+
+```{r setup, include=FALSE}
+
+memory.limit(32*1024^2)
+
+#Packages to load
+packagesReqd <- c("tidyverse", "ggridges", "lubridate", "readxl", "haven", "vroom", "pacman", "glue","git2r","getPass","dplyr","dbplyr","odbc","DBI","ggplot2")
+new.packages <- packagesReqd[!(packagesReqd %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+invisible(lapply(packagesReqd, library, character.only = T, warn.conflicts = F, quietly = T))
+
+#Filepaths
+project <- "Z:/Projects/20211220 - Omicron Severity Hospitalisation/BA2"
+
+#DataLake - not available on public domain
+remotes::install_git('https://gitlab.phe.gov.uk/packages/DataLakeR',
+                      credentials = git2r::cred_user_pass("iwanibintiabdulaziz", getPass::getPass()))
+if (!require(remotes)) install.packages("remotes")
+remotes::install_git('https://gitlab.phe.gov.uk/packages/DataLakeR')
+library(DataLakeR)
+
+
+#How far back in calendar time to extract data
+date.start <- as_date("2021-12-01")
+#Date of data extraction
+date.data  <- as_date("2022-03-25") 
+date.mort <- as_date("2022-05-16")
+date.sgtf <- as_date("2022-03-15") 
+
+#Flag to set whether to remove intermediary datasets (to free up memory)
+cleanup <- TRUE
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+
+# Read confirmed cases
+
+```{r read confirmed cases}
+
+##------------ Load in episode level data
+
+ccList <- read_dta(glue("{project}/Data/Combined_Case_Data.dta"),
+  col_select = c(finalid 
+              ,cdr_specimen_request_sk  
+              ,cdr_opie_id 
+              ,episode_number 
+              ,latest_episode_indicator 
+              ,pillar 
+              ,earliest_specimen_date 
+              ,latest_specimen_date 
+              ,specimen_number 
+              ,patient_sex 
+              ,patient_nhs_number
+              ,age_in_months 
+              ,age_in_years 
+              ,ethnicity_final  
+              ,ltla_code 
+              ,ltla_name 
+              ,utla_code 
+              ,utla_name 
+              ,phec_code 
+              ,phec_name 
+              ,nhser_name
+              ,nhser_code
+              ,imd_decile 
+              ,imd_rank 
+              ,asymptomatic_indicator 
+              ,symptom_onset_date 
+              ,casecategory 
+              ,sgtf
+              ,gen_type  
+              ,variant_confidence 
+              ,variant 
+              ,variant_specimen_number 
+              ,variant_sample_date 
+              ,import_date
+              ,pillar_2_testingkit
+              ,testcentreid
+              ,lab_report_date
+              )) 
+
+
+#Restrict to those within recent time period
+ccList <- ccList %>% 
+ filter(earliest_specimen_date >= date.start) 
+
+
+#Renaming and strings to factors
+ccList <- ccList %>%
+  rename(Onsetdate = symptom_onset_date,
+         specimen_date = earliest_specimen_date,
+         final_id = finalid,
+         sex = patient_sex,
+         age = age_in_years,
+         PHEC_name = phec_name)
+
+#Recategorising variables
+ccList <- ccList %>%
+  mutate(Onsetdate = ymd(Onsetdate),
+         specimen_date = ymd(specimen_date),
+         lab_report_date = ymd(lab_report_date),
+         pillar = factor(pillar),
+         nhser_name = factor(nhser_name),
+         PHEC_name = factor(PHEC_name),
+         utla_name = factor(utla_name),
+         ltla_name = factor(ltla_name),
+         sex = factor(sex),
+         asymptomatic_indicator = factor(asymptomatic_indicator),
+         ethnicity_final = factor(ethnicity_final),
+         pillar_2_testingkit = factor(pillar_2_testingkit),
+         testcentreid = factor(testcentreid))
+
+backup <- ccList
+
+#ccList <- backup
+
+```
+
+
+
+#Link to SGTF
+
+Link to the SGTF linelist:
+```{r sgtf}
+
+## link with sgtf linelist
+
+sgtfFile <- paste0("Z:/SGTF_linelist_", format(date.sgtf, "%Y%m%d"), ".csv", sep = "")
+
+sgtf <- read.csv(sgtfFile)
+
+###------Filter out specimens with no SGTF information
+sgtf <- sgtf %>%
+  filter(sgtf_under30CT %in% (0:1))
+
+sgtf <- sgtf %>%
+  rename(final_id = FINALID,
+         CDR_Specimen_Request_SK.sgtf = CDR_Specimen_Request_SK,
+         Specimen_Number.sgtf = Specimen_Number,
+         sex.sgtf = sex,
+         age.sgtf = age,
+         Source_Lab.sgtf = Source_Lab,
+         ll_sgtf = sgtf) %>%
+  mutate(
+    ll_sgtf = factor(ll_sgtf, levels = 0:1),
+    sgtf_under30CT = factor(sgtf_under30CT, levels = 0:1),
+    specimen_date = ymd(specimen_date)
+    )
+
+##---------- Removal of discrepent results (SGTF and SGTP within one episode)
+
+sgtf <- sgtf %>%
+  mutate(
+    sneg = case_when(
+      sgtf_under30CT == 1 ~ 1,
+      TRUE ~ 0
+    ),
+    spos = case_when(
+      sgtf_under30CT == 0 ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+sgtf.sum = sgtf %>% group_by(first_cdr_specimen_request_sk) %>% summarise(spos=sum(spos),sneg=sum(sneg),specimen_date.sgtf=max(specimen_date))
+
+# reduce from test-level dataset to episode-level dataset by counting the total number of spos and sneg specimens for each episode id (first cdr specimen request sk)
+
+# reset sneg to at least one sneg (0/1) BA1
+sgtf.sum$sneg[sgtf.sum$sneg>0]=1
+# reset spos to at least one spos (0/1) BA2
+sgtf.sum$spos[sgtf.sum$spos>0]=1
+
+#Create clean dataset for merging, of just episodes where SGTF OR SGTP is present
+sgtf.clean = sgtf.sum %>% 
+  
+  filter((sneg==1 & spos==0)|(sneg==0 & spos==1)) %>%
+  rename(cdr_specimen_request_sk = first_cdr_specimen_request_sk) %>%
+  mutate(
+     ost_sgtf = case_when(
+      sneg == 1 ~ 1,
+      spos == 1 ~ 0)) %>%
+  select(c(cdr_specimen_request_sk,ost_sgtf,specimen_date.sgtf))
+         
+
+
+#link with cc list by episode identifier
+sfp_use_dat <- 
+  left_join(
+    ccList, 
+    sgtf.clean %>% 
+      mutate(inSGTF = TRUE),
+    by = "cdr_specimen_request_sk") %>% 
+  mutate(timeSpecimenSGTF = as.numeric(specimen_date.sgtf - specimen_date)
+          )
+
+## 348 cases where SGene result is different, looks like these aren't available in SGTF linelist (otherwise would have been removed as reinfections) To remove
+sfp_use_dat <- sfp_use_dat %>%
+  mutate(
+    toremove = case_when(
+      (sgtf==1 & ost_sgtf==0) ~ 1,
+      (sgtf==0 & ost_sgtf==1) ~ 1,
+      TRUE ~ 0)
+  ) 
+
+nBefore <- nrow(sfp_use_dat)
+nBefore
+sfp_use_dat <- sfp_use_dat %>%
+  filter (toremove == 0)
+nAfter <- nrow(sfp_use_dat)
+nAfter
+nAfter-nBefore
+
+#Drop episode level SGTF and use OST specimen SGTF variable
+sfp_use_dat <- sfp_use_dat %>%
+  select(-c(sgtf)) %>%
+  rename(sgtf = ost_sgtf)
+
+
+## Check for finalid duplicates
+
+table(sfp_use_dat$specimen_date)
+
+sfp_use_dat %>% dplyr::count(duplicated(final_id))
+
+if(cleanup) {
+  rm(ccList)
+  rm(sgtf.clean)
+  rm(sgtf)
+  rm(sgtf.sum)
+ 
+}
+
+
+```
+
+
+## Logic to assign variant status based on genotyping and S-Gene status
+
+```{r assigning vam status}
+
+#----------------(1) Reclassify SGTF & provisional genotyping+SGTF to variant call
+
+
+sfp_use_dat <- sfp_use_dat %>% 
+        mutate(
+ #Update variant   
+    variantOriginal = variant,
+    
+        gen_type = 
+      case_when(
+          #Tag gen_type as S-gene if after 24th and SGTF/SGTP
+          variant %in% ("") & sgtf %in% (0:1) & specimen_date >= as_date("2022-01-24") ~ "SGTF",
+          #Tag gen_type as SGTF+Genotyping if had genotyping and variant call is BA1/BA2
+          variant %in% c("VOC-21NOV-01","VUI-22JAN-01") & sgtf %in% (0:1) & gen_type %in% c("Genotyping")  ~ "SGTF + Genotyping",
+          #otherwise keep as gen_type
+          TRUE ~ gen_type)
+        )
+      
+#Update gen type
+sfp_use_dat <- sfp_use_dat %>% 
+        mutate(
+      variant = case_when(
+          #BA1 - SGTF & after 24th
+          variant %in% ("") & sgtf %in% 1 & specimen_date >= as_date("2022-01-24") ~ "VOC-21NOV-01", 
+          #BA2 - SGTP & after 24th
+          variant %in% ("") & sgtf %in% 0 & specimen_date >= as_date("2022-01-24") ~ "VUI-22JAN-01",
+          #BA2 - if genotyped as BA1 but is SGTP
+          variant %in% c("VOC-21NOV-01") & sgtf %in% 0 & gen_type %in% c("SGTF + Genotyping") ~ "VUI-22JAN-01",
+          #otherwise variant remains the same
+          TRUE ~ variant)
+        )
+
+##-------------------(2) Restrictions
+
+##Keep only BA1/BA2
+sfp_use_dat <- sfp_use_dat %>% 
+  filter(variant %in% c("VOC-21NOV-01","VUI-22JAN-01"))
+
+##Keep only validated sequencing, SGTF, SGTF+Genotyping only
+sfp_use_dat <- sfp_use_dat %>% 
+  filter(gen_type %in% c("Validated sequencing","SGTF + Genotyping","SGTF"))
+
+table(sfp_use_dat$variant)
+table(sfp_use_dat$gen_type)
+
+#Check for duplicates
+sfp_use_dat %>% count(duplicated(final_id))
+
+#Check for episodes where variant specimen date is earlier than episode earliest specimen date (this is an error raised to SGSS team, currently to remove these cases - should be resolved now and nothing dropped)
+sfp_use_dat <- sfp_use_dat %>%
+  mutate(
+    sample_date_to_earliest = specimen_date-variant_sample_date,
+    todrop = case_when(sample_date_to_earliest>0 & gen_type %in% c("Validated sequencing","SGTF + Genotyping") ~ 1,
+                       TRUE ~ 2)
+    )
+
+
+#DROPS odd cases
+nBefore <- nrow(sfp_use_dat)
+nBefore
+sfp_use_dat <- sfp_use_dat %>%
+  filter(todrop==2)
+nAfter <- nrow(sfp_use_dat)
+nAfter
+nAfter-nBefore
+
+
+ 
+
+```
+
+#Link to deaths
+
+
+```{r read deaths}
+
+#Load in mortality line list
+mortality <- read_dta(paste0("Z:/Full mortality data ",format(date.mort, "%Y%m%d"),".dta"),
+  col_select = c(finalid
+                 ,dod
+                 ,death_type28
+                 ,death_type60cod 
+                 ,death_type 
+                 ,tt_death 
+                 ,tt_death_cat 
+                 ,covidcod
+                 ,ethnicity_final)
+  )
+
+#Join on deaths variables
+sfp_use_dat <- 
+  left_join(
+    sfp_use_dat, 
+    mortality  %>% rename(final_id = finalid, 
+                      ethnicity_final.d = ethnicity_final),
+    by = "final_id")
+
+table(sfp_use_dat$death_type60cod) 
+table(sfp_use_dat$death_type28)    
+
+if(cleanup) {
+  rm(mortality)
+}
+
+```
+
+#Link to NIMS (vaccinations)
+
+```{r read vaccinations}
+
+#Vaccination
+
+sfp_use_dat <- sfp_use_dat %>%
+  rename(nhs_number = patient_nhs_number)
+
+#Create small dataset to push to Datastore
+formatching <- sfp_use_dat %>%
+  select(c(final_id, episode_number, cdr_specimen_request_sk, nhs_number))
+
+#Create odbc connection to EpiCell workspace
+#Push to SQL for linkage
+dbWriteTable(cvd_19_con, Id(schema = "dbo", table = "Severity_BA1_BA2"), overwrite = TRUE, formatching)
+
+### NIMS LINKAGE OCCURS IN SQL (02_NIMS Linkage.sql) ###
+
+#Extract linked table
+vaccine <- dbReadTable(cvd_19_con, Id(schema = "dbo", table = "Severity_BA1_BA2_NIMS"))
+
+#Disconnect from datastore
+dbDisconnect(cvd_19_con)
+
+#Link into ccList
+sfp_use_dat <- left_join(
+  sfp_use_dat,
+  vaccine %>%
+    select(final_id,cdr_specimen_request_sk,DATE_D1,DATE_D2,DATE_D3,DOSE1,DOSE2,DOSE3,NHS_Check,v_status),
+  by = c("final_id","cdr_specimen_request_sk")
+)
+
+names(sfp_use_dat) <- tolower(names(sfp_use_dat))
+
+table(sfp_use_dat$v_status)
+
+
+
+if(cleanup) {
+  rm(cvd_19_con)
+  rm(formatching)
+  rm(vaccine)
+  
+}
+  
+
+backup <- sfp_use_dat
+
+```
+
+
+
+
+#Link to hospitalisations
+
+```{r read hosp}
+
+hosp_dat <- get_datalake(
+paste0(
+"
+SELECT h.[final_id],
+       h.[episode_order],
+       h.[sex],
+       h.[age],
+       h.[ethnicity_final],
+       h.[linkset],
+       h.[hoslink],
+       h.[specimen_date],
+       h.[hospital_event_rank],
+       h.[covidICD],
+       h.[hospital_in],
+       h.[hospital_out],
+       h.[currently_admitted],
+       h.[still_in_hospital],
+       h.[spell_start_date],
+       h.[spell_end_date],
+       h.[arrival_date],
+       h.[departure_date],
+       h.[diff_pos_admit],
+       h.[diff_pos_discharge],
+       h.[onset_category],
+       h.[onset_category_simple],
+       h.[nhs_region],
+       h.[trust_name],
+       h.[pillar],
+       h.[diag_n],
+       h.[charlson_score],
+       h.[charlson_index],
+       h.[ecds_discharge],
+       h.[emergency_care_chief_complaint_code],
+       h.[emergency_care_chief_complaint_is_injury_related],
+       h.[discharge_destination],
+       h.[discharge_destination_desc],
+       h.[inpatient_stay],
+       h.[pos_in_hospital],
+       h.[episode_number],
+       h.[mega_spell_id]
+FROM Y082_COVID19HlthCases_PID.dbo.HospitalOnset_COVID_EPS h
+WHERE h.spell_start_date >= '", date.start - 90, "' OR  h.arrival_date >= '", date.start - 90, "'")
+)
+
+
+## 323,294 hospital spell IDs that have covidICD10 flagged between since Wed 14th Oct (90 days prior to 1st Dec 2021)
+## Only 45,712 mega_spell_id in ICD EPS table overall
+
+hosp_dat <- hosp_dat %>%
+  mutate(specimen_date    = ymd(specimen_date),
+         spell_start_date = ymd(spell_start_date),
+         spell_end_date   = ymd(spell_end_date),
+         arrival_date     = ymd(arrival_date),
+         departure_date   = ymd(departure_date),
+         hospital_in      = ymd(hospital_in),
+         hospital_out     = ymd(hospital_out)
+         )
+
+
+#2022-02-02 Recalculate buggy hospital_in and hospital_out variables. 
+# Prioritise SUS dates (spell_start_date, spell_end_date) over ECDS (arrival_date, departure_date)
+hosp_dat <- hosp_dat %>%
+  mutate(hospital_in.original=hospital_in,
+         hospital_out.original=hospital_out,
+         hospital_in = case_when(
+           !is.na(spell_start_date) ~ spell_start_date,
+           !is.na(arrival_date)     ~ arrival_date,
+           TRUE ~ NA_Date_
+         ),
+         hospital_out = case_when(
+           !is.na(spell_end_date) ~ spell_end_date,
+           !is.na(departure_date) ~ departure_date,
+           TRUE ~ NA_Date_
+         )
+)
+
+
+#2022-01-17: Where there are duplicates in the hospital events with same hospital_in date but potentially inconsistent information, prioritise (1) most severe ecds_discharge reason, (2) longest stay (latest hospital_out), (3) first hospital_event_rank
+hosp_dat <- hosp_dat %>%
+  mutate(ecds_discharge.ordered = factor(ecds_discharge, levels=c("Died","Admitted","Transfer","Ambulatory/Short stay","Discharged"), ordered=TRUE)) %>%
+  arrange(final_id,specimen_date,hospital_in,ecds_discharge.ordered,desc(hospital_out),hospital_event_rank)
+
+hosp_dat <- 
+  hosp_dat %>% 
+  mutate(linkset.src = if_else(linkset %in% c("CoV",""), "Unlinked", NA_character_))
+
+
+  #merge main dataset with hospitalisation data
+nrow(sfp_use_dat)
+nrow(hosp_dat)
+
+hosp_dat$final_id <- as.numeric(hosp_dat$final_id)
+
+ccAllHosp <- 
+  inner_join(
+    sfp_use_dat   %>% 
+              select(final_id,specimen_date),
+    hosp_dat %>% rename(sex.h = sex,
+                        age.h = age,
+                        ethnicity_final.h = ethnicity_final,
+                        specimen_date.h = specimen_date,
+                        pillar.h = pillar),
+    by = "final_id") %>% 
+  mutate( timeSpecimenHosp    = as.numeric(hospital_in  - specimen_date),
+          timeSpecimenHospOut = as.numeric(hospital_out - specimen_date)
+          )
+
+
+
+# Subset with time from last preceding hospitalisation to positive test
+
+hospBeforeSpecimen_dat <- ccAllHosp %>% 
+  select(final_id,
+         timeSpecimenHosp,
+         specimen_date) %>%
+  filter(timeSpecimenHosp < 0) %>%
+  group_by(final_id,specimen_date) %>%
+  slice_max(timeSpecimenHosp, n=1, with_ties=FALSE) %>%
+  ungroup() %>%
+  mutate( hospBeforeSpecimen.14d = -14 <= timeSpecimenHosp & timeSpecimenHosp <= -1,
+          hospBeforeSpecimen.28d = -28 <= timeSpecimenHosp & timeSpecimenHosp <= -1,
+          hospBeforeSpecimen.42d = -42 <= timeSpecimenHosp & timeSpecimenHosp <= -1,
+          hospBeforeSpecimen.60d = -60 <= timeSpecimenHosp & timeSpecimenHosp <= -1
+          ) %>%
+  rename(timeSpecimenHosp.neg = timeSpecimenHosp)
+
+# Subset with time from positive test to first subsequent hospitalisation
+hospAfterSpecimen_dat <- ccAllHosp %>% 
+  mutate(
+    
+    linkset = ifelse(is.na(linkset) | linkset=="CoV", "Unlinked", linkset),
+    #injury = ifelse(addNA(ecds_injury_code)==1, 1, 0),
+    injury = ifelse(addNA(emergency_care_chief_complaint_is_injury_related)==1, 1, 0),
+    
+    hosp_interval = as.numeric( as_date(hospital_out) - as_date(hospital_in) ),
+
+    valid_hosp = case_when(
+      linkset != "Unlinked" &
+        (timeSpecimenHosp %in% 0:14)                         #if test to hosp 0 to 14 days
+           ~ 1,
+      TRUE ~ 0 ),
+    
+    hospitalised = if_else(
+      valid_hosp==1 & (
+        ( hosp_interval > 0 ) | 
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Admitted","Transfer") ) |
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Died") ) |
+        ( grepl("SUS", linkset,fixed=TRUE) & discharge_destination == "79" )
+        ),
+      "Yes", "No" ),
+    
+    hospitalised_covidicd = if_else(
+      valid_hosp==1 & covidICD==1 & (
+        ( hosp_interval > 0 ) | 
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Admitted","Transfer") ) |
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Died") ) |
+        ( grepl("SUS", linkset,fixed=TRUE) & discharge_destination == "79" )
+        ),
+      "Yes", "No" ),
+    
+    hospitalised_prim_covidicd = if_else(
+      valid_hosp==1 & covidICD==1 & episode_order==1 & (
+        ( hosp_interval > 0 ) | 
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Admitted","Transfer") ) |
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Died") ) |
+        ( grepl("SUS", linkset,fixed=TRUE) & discharge_destination == "79" )
+        ),
+      "Yes", "No" ),
+    
+    hospitalised_subgroups = factor(case_when(
+      valid_hosp==1 & injury!=1 & ( linkset == "CoV:ECDS" & ecds_discharge %in% c("Died") ) ~ "ECDS, Dead",
+      valid_hosp==1 & injury!=1 & ( linkset == "CoV:ECDS" & ecds_discharge %in% c("Admitted","Transfer") ) ~ "ECDS, Admitted/Transferred",
+      valid_hosp==1 & injury!=1  & ( grepl("SUS",linkset,fixed=TRUE) & hosp_interval == 0 & discharge_destination == "79" ) ~ "SUS 0d in hospital, Dead",
+      valid_hosp==1 & injury!=1  & ( grepl("SUS",linkset,fixed=TRUE) & hosp_interval > 0 ) ~ "SUS >0d in hospital",
+      TRUE ~ "Not hospitalised"
+      ), levels=c("Not hospitalised","ECDS, Dead","ECDS, Admitted/Transferred","SUS 0d in hospital, ICD+Dead","SUS 0d in hospital, Dead","SUS 0d in hospital, ICD","SUS >0d in hospital")),
+
+    AttendanceHosp = factor(if_else(valid_hosp==1, "Yes", "No"), levels=c("No","Yes")),
+
+    #incorporate censoring for injuries
+    hospitalised_noInj=hospitalised,
+    AttendanceHosp_noInj=AttendanceHosp,
+    hospitalised_noInj   = factor(if_else(hospitalised=="Yes"   & injury==1, "No", as.character(hospitalised)), levels=c("No","Yes")),
+    AttendanceHosp_noInj = factor(if_else(AttendanceHosp=="Yes" & injury==1, "No", as.character(AttendanceHosp)), levels=c("No","Yes")),
+
+  
+    #Alternative outcome definition: any attendance, length of stay >= 1 day
+    HospAny1dLoS = 
+      factor( 
+        if_else(
+          valid_hosp==1 & (
+            hosp_interval > 0 
+          ),
+          "Yes", "No" ), levels = c("No","Yes")
+        ),
+    
+    HospAny2dLoS = 
+      factor( 
+        if_else(
+          valid_hosp==1 & (
+            hosp_interval > 1 
+          ),
+          "Yes", "No"), levels = c("No","Yes")
+        ),
+    
+    HospAny5dLoS = 
+      factor( 
+        if_else(
+          valid_hosp==1 & (
+            hosp_interval >= 5 
+          ),
+          "Yes", "No"), levels = c("No","Yes")
+        ),
+    
+    #MAIN OUTCOME DEFINITION: any admissions, length of stay > 1 day OR if ECDS stay ended in death
+    
+    HospAdm2dLoS_og = 
+      factor( 
+        if_else(
+          hospitalised=="Yes" & (
+            hosp_interval > 1 
+          ),
+          "Yes", "No"), levels = c("No","Yes")
+        ),
+    
+    HospAdm2dLoS = 
+      factor( 
+        if_else(
+          (hospitalised=="Yes" & hosp_interval > 1) 
+          | (grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Died")
+          | (grepl("SUS", linkset,fixed=TRUE) & discharge_destination == "79")),
+          "Yes", "No"), levels = c("No","Yes")
+        ),
+    
+    #Alternative outcome definition: ECDS admissions(/deaths)
+    HospAnyECDS = 
+      factor( 
+        if_else(
+          valid_hosp==1 & (
+            ecds_discharge %in% c("Died","Admitted","Transfer")
+          ),
+          "Yes", "No" ), levels = c("No","Yes")
+        ),
+    
+    
+    #Alternative outcome definition: dashboard (positive test within 14 days of admission?/attendance?, or already hospitalised who test positive)
+    HospDashboard = 
+      factor( 
+        if_else(
+          valid_hosp==1 & (
+            ( (timeSpecimenHospOut>0) | (timeSpecimenHospOut==0 & timeSpecimenHosp==0) ) |
+              is.na(timeSpecimenHospOut)
+          ),
+          "Yes", "No" ), levels = c("No","Yes")
+      ),
+    
+
+    
+    
+
+    #Restrict to only include events in days -1:14 (not 0:14)    
+    
+    valid_hosp_altInclMINUS1 = case_when(
+      linkset != "Unlinked" &
+        ( (timeSpecimenHosp %in% -1:14) )                         #if test to hosp 0 to 14 days
+           ~ 1,
+      TRUE ~ 0 ),
+    hospitalised_altInclMINUS1 = if_else(
+      valid_hosp_altInclMINUS1==1 & (
+        ( hosp_interval > 0 ) | 
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Admitted","Transfer") ) |
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Died") ) |
+        ( grepl("SUS", linkset,fixed=TRUE) & discharge_destination == "79" )
+        ),
+      "Yes", "No" ),
+
+
+    AttendanceHosp_altInclMINUS1 = factor(if_else(valid_hosp_altInclMINUS1==1, "Yes", "No"), levels=c("No","Yes")),
+    
+    #incorporate censoring for emergency care due to injury
+    hospitalised_altInclMINUS1_noInj=hospitalised_altInclMINUS1,
+    AttendanceHosp_altInclMINUS1_noInj=AttendanceHosp_altInclMINUS1,
+    hospitalised_altInclMINUS1_noInj   = if_else(hospitalised_altInclMINUS1=="Yes"   & injury==1, "No", as.character(hospitalised_altInclMINUS1)),
+    AttendanceHosp_altInclMINUS1_noInj = if_else(AttendanceHosp_altInclMINUS1=="Yes" & injury==1, "No", as.character(AttendanceHosp_altInclMINUS1)),
+
+    
+    
+    #Restrict to only include events in days 1:14 (not -1:14)    
+    
+    valid_hosp_altIncl1 = case_when(
+      linkset != "Unlinked" &
+        ( (timeSpecimenHosp %in% 1:14) )                         #if test to hosp 1 to 14 days
+           ~ 1,
+      TRUE ~ 0 ),
+    hospitalised_altIncl1 = if_else(
+      valid_hosp_altIncl1==1 & (
+        ( hosp_interval > 0 ) | 
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Admitted","Transfer") ) |
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Died") ) |
+        ( grepl("SUS", linkset,fixed=TRUE) & discharge_destination == "79" )
+        ),
+      "Yes", "No" ),
+
+
+    AttendanceHosp_altIncl1 = factor(if_else(valid_hosp_altIncl1==1, "Yes", "No"), levels=c("No","Yes")),
+    
+    #incorporate censoring for emergency care due to injury
+    hospitalised_altIncl1_noInj=hospitalised_altIncl1,
+    AttendanceHosp_altIncl1_noInj=AttendanceHosp_altIncl1,
+    hospitalised_altIncl1_noInj   = if_else(hospitalised_altIncl1=="Yes"   & injury==1, "No", as.character(hospitalised_altIncl1)),
+    AttendanceHosp_altIncl1_noInj = if_else(AttendanceHosp_altIncl1=="Yes" & injury==1, "No", as.character(AttendanceHosp_altIncl1)),
+
+    
+
+    
+
+    #Restrict to not include day -1 cases who were released from hospital same day (timeSpecimenHosp==-1 & hosp_interval==0)
+    
+    valid_hosp_altNoMINUS1Released = case_when(
+      linkset != "Unlinked" &
+        ( (timeSpecimenHosp %in% 0:14) | (timeSpecimenHosp == -1 & hosp_interval > 0) )                         #if test to hosp -1 to 14 days
+           ~ 1,
+      TRUE ~ 0 ),
+    hospitalised_altNoMINUS1Released = if_else(
+      valid_hosp_altNoMINUS1Released==1 & (
+        ( hosp_interval > 0 ) | 
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Admitted","Transfer") ) |
+        ( grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Died") ) |
+        ( grepl("SUS", linkset,fixed=TRUE) & discharge_destination == "79" )
+        ),
+      "Yes", "No" ),
+
+
+    AttendanceHosp_altNoMINUS1Released = factor(if_else(valid_hosp_altNoMINUS1Released==1, "Yes", "No"), levels=c("No","Yes")),
+    
+    #incorporate censoring for emergency care due to injury
+    hospitalised_altNoMINUS1Released_noInj=hospitalised_altNoMINUS1Released,
+    AttendanceHosp_altNoMINUS1Released_noInj=AttendanceHosp_altNoMINUS1Released,
+    hospitalised_altNoMINUS1Released_noInj   = if_else(hospitalised_altNoMINUS1Released=="Yes"   & injury==1, "No", as.character(hospitalised_altNoMINUS1Released)),
+    AttendanceHosp_altNoMINUS1Released_noInj = if_else(AttendanceHosp_altNoMINUS1Released=="Yes" & injury==1, "No", as.character(AttendanceHosp_altNoMINUS1Released)),
+
+    #flag for those who fit general admissions but have no hospital_out date
+    HospAdmNoLoS = factor(if_else(
+      valid_hosp==1 & 
+        (grepl("ECDS",linkset,fixed=TRUE) & ecds_discharge %in% c("Admitted","Transfer")) &
+        (is.na(hospital_out) | is.na(hosp_interval)),
+      "Yes", "No"), levels=c("No","Yes")),
+    
+    timeSpecimenHosp.hospitalised = if_else(hospitalised=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_covidicd = if_else(hospitalised_covidicd=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_prim_covidicd = if_else(hospitalised_prim_covidicd=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp = if_else(AttendanceHosp=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_noInj = if_else(hospitalised_noInj=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp_noInj = if_else(AttendanceHosp_noInj=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.HospAny1dLoS = if_else(HospAny1dLoS=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.HospAny2dLoS = if_else(HospAny2dLoS=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.HospAny5dLoS = if_else(HospAny5dLoS=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.HospAdm2dLoS = if_else(HospAdm2dLoS=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.HospAnyECDS = if_else(HospAnyECDS=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_altInclMINUS1 = if_else(hospitalised_altInclMINUS1=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp_altInclMINUS1 = if_else(AttendanceHosp_altInclMINUS1=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_altInclMINUS1_noInj = if_else(hospitalised_altInclMINUS1_noInj=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp_altInclMINUS1_noInj = if_else(AttendanceHosp_altInclMINUS1_noInj=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_altIncl1 = if_else(hospitalised_altIncl1=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp_altIncl1 = if_else(AttendanceHosp_altIncl1=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_altIncl1_noInj = if_else(hospitalised_altIncl1_noInj=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp_altIncl1_noInj = if_else(AttendanceHosp_altIncl1_noInj=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_altNoMINUS1Released = if_else(hospitalised_altNoMINUS1Released=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp_altNoMINUS1Released = if_else(AttendanceHosp_altNoMINUS1Released=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.hospitalised_altNoMINUS1Released_noInj = if_else(hospitalised_altNoMINUS1Released_noInj=='Yes', timeSpecimenHosp, NA_real_),
+    timeSpecimenHosp.AttendanceHosp_altNoMINUS1Released_noInj = if_else(AttendanceHosp_altNoMINUS1Released_noInj=='Yes', timeSpecimenHosp, NA_real_)
+    
+
+
+    
+    
+  )
+
+
+# Checking individuals who fit broader admission def with no hospital_out
+nolos <- hospAfterSpecimen_dat %>% filter(HospAdmNoLoS == "Yes")
+nolos <- hospAfterSpecimen_dat %>% filter(is.na(hospital_out) & valid_hosp == 1)
+table(nolos$ecds_discharge)
+
+
+hospAfterSpecimen_dat %>% count(linkset)
+hospAfterSpecimen_dat %>% count(hospitalised)
+hospAfterSpecimen_dat %>% count(HospAdm2dLoS)
+hospAfterSpecimen_dat %>% count(AttendanceHosp)
+hospAfterSpecimen_dat %>% count(hospitalised_noInj)
+hospAfterSpecimen_dat %>% count(AttendanceHosp_noInj)
+hospAfterSpecimen_dat %>% count(HospAny1dLoS)
+hospAfterSpecimen_dat %>% count(HospAnyECDS)
+hospAfterSpecimen_dat %>% count(hospitalised_altInclMINUS1)
+hospAfterSpecimen_dat %>% count(AttendanceHosp_altInclMINUS1)
+hospAfterSpecimen_dat %>% count(hospitalised_altInclMINUS1_noInj)
+hospAfterSpecimen_dat %>% count(AttendanceHosp_altInclMINUS1_noInj)
+hospAfterSpecimen_dat %>% count(hospitalised_altIncl1)
+hospAfterSpecimen_dat %>% count(AttendanceHosp_altIncl1)
+hospAfterSpecimen_dat %>% count(hospitalised_altIncl1_noInj)
+hospAfterSpecimen_dat %>% count(AttendanceHosp_altIncl1_noInj)
+hospAfterSpecimen_dat %>% count(hospitalised_altNoMINUS1Released)
+hospAfterSpecimen_dat %>% count(AttendanceHosp_altNoMINUS1Released)
+hospAfterSpecimen_dat %>% count(hospitalised_altNoMINUS1Released_noInj)
+hospAfterSpecimen_dat %>% count(AttendanceHosp_altNoMINUS1Released_noInj)
+
+#retain first time-to-event for each outcome
+silent_min <- function(x,na.rm) {if (any(!is.na(x))) min(x,na.rm=na.rm) else NA_real_}
+silent_max <- function(x,na.rm) {if (any(!is.na(x))) max(x,na.rm=na.rm) else NA_real_}
+
+#Gen min/max length of stay if hospitalised==yes | attendancehosp==yes
+hosplos <- hospAfterSpecimen_dat %>%
+  filter(hospitalised == "Yes") %>%
+  group_by(final_id, specimen_date) %>%
+  mutate (
+    maxlos_adm = silent_max(hosp_interval, na.rm=T),
+    minlos_adm = silent_min(hosp_interval, na.rm=T),
+  ) %>%
+  select(final_id, specimen_date, minlos_adm, maxlos_adm) %>%
+  distinct()
+
+#leftjoin to hospAfterSpecimen_dat, to be able to include in collapse/dedup
+hospAfterSpecimen_dat <- 
+  left_join(
+    hospAfterSpecimen_dat,
+    hosplos,
+    by = c("final_id","specimen_date"))
+
+hospAfterSpecimen_dat <- hospAfterSpecimen_dat %>% 
+  filter(  addNA(HospAdm2dLoS)=="Yes" |
+           addNA(hospitalised)=="Yes" |
+           addNA(hospitalised_covidicd)=="Yes" |
+           addNA(hospitalised_prim_covidicd)=="Yes" |
+           addNA(AttendanceHosp)=="Yes" |
+           addNA(hospitalised_noInj)=="Yes" |
+           addNA(AttendanceHosp_noInj)=="Yes" |
+           addNA(HospAny1dLoS)=="Yes" |
+           addNA(HospAnyECDS)=="Yes" |
+           addNA(hospitalised_altInclMINUS1)=="Yes" |
+           addNA(AttendanceHosp_altInclMINUS1)=="Yes" |
+           addNA(hospitalised_altInclMINUS1_noInj)=="Yes" |
+           addNA(AttendanceHosp_altInclMINUS1_noInj)=="Yes" |
+           addNA(hospitalised_altIncl1)=="Yes" |
+           addNA(AttendanceHosp_altIncl1)=="Yes" |
+           addNA(hospitalised_altIncl1_noInj)=="Yes" |
+           addNA(AttendanceHosp_altIncl1_noInj)=="Yes" |
+           addNA(hospitalised_altNoMINUS1Released)=="Yes" |
+           addNA(AttendanceHosp_altNoMINUS1Released)=="Yes" |
+           addNA(hospitalised_altNoMINUS1Released_noInj)=="Yes" |
+           addNA(AttendanceHosp_altNoMINUS1Released_noInj)=="Yes"
+  ) %>%
+  group_by(final_id,specimen_date) %>% 
+  summarise(hospitalised= factor( ifelse( silent_max(hospitalised=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised=silent_min(timeSpecimenHosp.hospitalised,na.rm=TRUE),
+
+            hospitalised_covidicd= factor( ifelse( silent_max(hospitalised_covidicd=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_covidicd=silent_min(timeSpecimenHosp.hospitalised_covidicd,na.rm=TRUE),
+            
+            hospitalised_prim_covidicd= factor( ifelse( silent_max(hospitalised_prim_covidicd=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_prim_covidicd=silent_min(timeSpecimenHosp.hospitalised_prim_covidicd,na.rm=TRUE),
+            
+            AttendanceHosp= factor( ifelse( silent_max(AttendanceHosp=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp=silent_min(timeSpecimenHosp.AttendanceHosp,na.rm=TRUE),
+
+            hospitalised_noInj= factor( ifelse( silent_max(hospitalised_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_noInj=silent_min(timeSpecimenHosp.hospitalised_noInj,na.rm=TRUE),
+
+            AttendanceHosp_noInj= factor( ifelse( silent_max(AttendanceHosp_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp_noInj=silent_min(timeSpecimenHosp.AttendanceHosp_noInj,na.rm=TRUE),
+
+            HospAny1dLoS= factor( ifelse( silent_max(HospAny1dLoS=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.HospAny1dLoS=silent_min(timeSpecimenHosp.HospAny1dLoS,na.rm=TRUE),
+            
+            HospAny2dLoS= factor( ifelse( silent_max(HospAny2dLoS=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.HospAny2dLoS=silent_min(timeSpecimenHosp.HospAny2dLoS,na.rm=TRUE),
+            
+            HospAny5dLoS= factor( ifelse( silent_max(HospAny5dLoS=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.HospAny5dLoS=silent_min(timeSpecimenHosp.HospAny5dLoS,na.rm=TRUE),
+            
+            HospAdm2dLoS= factor( ifelse( silent_max(HospAdm2dLoS=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.HospAdm2dLoS=silent_min(timeSpecimenHosp.HospAdm2dLoS,na.rm=TRUE),
+
+            HospAnyECDS= factor( ifelse( silent_max(HospAnyECDS=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.HospAnyECDS=silent_min(timeSpecimenHosp.HospAnyECDS,na.rm=TRUE),
+
+            hospitalised_altInclMINUS1= factor( ifelse( silent_max(hospitalised_altInclMINUS1=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_altInclMINUS1=silent_min(timeSpecimenHosp.hospitalised_altInclMINUS1,na.rm=TRUE),
+
+            AttendanceHosp_altInclMINUS1= factor( ifelse( silent_max(AttendanceHosp_altInclMINUS1=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp_altInclMINUS1=silent_min(timeSpecimenHosp.AttendanceHosp_altInclMINUS1,na.rm=TRUE),
+
+            hospitalised_altInclMINUS1_noInj= factor( ifelse( silent_max(hospitalised_altInclMINUS1_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_altInclMINUS1_noInj=silent_min(timeSpecimenHosp.hospitalised_altInclMINUS1_noInj,na.rm=TRUE),
+
+            AttendanceHosp_altInclMINUS1_noInj= factor( ifelse( silent_max(AttendanceHosp_altInclMINUS1_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp_altInclMINUS1_noInj=silent_min(timeSpecimenHosp.AttendanceHosp_altInclMINUS1_noInj,na.rm=TRUE),
+
+            hospitalised_altIncl1= factor( ifelse( silent_max(hospitalised_altIncl1=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_altIncl1=silent_min(timeSpecimenHosp.hospitalised_altIncl1,na.rm=TRUE),
+
+            AttendanceHosp_altIncl1= factor( ifelse( silent_max(AttendanceHosp_altIncl1=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp_altIncl1=silent_min(timeSpecimenHosp.AttendanceHosp_altIncl1,na.rm=TRUE),
+
+            hospitalised_altIncl1_noInj= factor( ifelse( silent_max(hospitalised_altIncl1_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_altIncl1_noInj=silent_min(timeSpecimenHosp.hospitalised_altIncl1_noInj,na.rm=TRUE),
+
+            AttendanceHosp_altIncl1_noInj= factor( ifelse( silent_max(AttendanceHosp_altIncl1_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp_altIncl1_noInj=silent_min(timeSpecimenHosp.AttendanceHosp_altIncl1_noInj,na.rm=TRUE),
+
+            hospitalised_altNoMINUS1Released= factor( ifelse( silent_max(hospitalised_altNoMINUS1Released=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_altNoMINUS1Released=silent_min(timeSpecimenHosp.hospitalised_altNoMINUS1Released,na.rm=TRUE),
+
+            AttendanceHosp_altNoMINUS1Released= factor( ifelse( silent_max(AttendanceHosp_altNoMINUS1Released=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp_altNoMINUS1Released=silent_min(timeSpecimenHosp.AttendanceHosp_altNoMINUS1Released,na.rm=TRUE),
+
+            hospitalised_altNoMINUS1Released_noInj= factor( ifelse( silent_max(hospitalised_altNoMINUS1Released_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.hospitalised_altNoMINUS1Released_noInj=silent_min(timeSpecimenHosp.hospitalised_altNoMINUS1Released_noInj,na.rm=TRUE),
+
+            AttendanceHosp_altNoMINUS1Released_noInj= factor( ifelse( silent_max(AttendanceHosp_altNoMINUS1Released_noInj=='Yes',na.rm=TRUE), 'Yes', 'No'), levels=c('No','Yes') ),
+            timeSpecimenHosp.AttendanceHosp_altNoMINUS1Released_noInj=silent_min(timeSpecimenHosp.AttendanceHosp_altNoMINUS1Released_noInj,na.rm=TRUE),
+            
+            minlos_adm = silent_min(minlos_adm,na.rm=TRUE), # min los
+            maxlos_adm = silent_max(maxlos_adm,na.rm=TRUE), # max los
+            .groups = "keep") %>%
+  ungroup()
+
+
+table(hospAfterSpecimen_dat$AttendanceHosp, useNA="always")
+table(hospAfterSpecimen_dat$HospAdm2dLoS, useNA="always")
+table(hospAfterSpecimen_dat$hospitalised, useNA="always")
+table(hospAfterSpecimen_dat$hospitalised_covidicd, useNA="always")
+
+hospAfterSpecimen_dat %>% count(AttendanceHosp)
+hospAfterSpecimen_dat %>% count(hospitalised)
+hospAfterSpecimen_dat %>% count(hospitalised_covidicd)  
+
+
+# Merge subsets with last preceding hospitalisation before and first hospitalisation after positive test 
+
+hospBeforeAfterSpecimen_dat <-
+  full_join(hospBeforeSpecimen_dat,
+            hospAfterSpecimen_dat, by=c("final_id","specimen_date"))
+
+
+
+# Merge main file with data on hospitalisations (last preceding hospitalisation before and first hospitalisation after positive test)
+
+sfp_use_dat <- 
+  left_join(
+    sfp_use_dat, 
+    hospBeforeAfterSpecimen_dat,
+    by = c("final_id","specimen_date"))
+
+
+if(cleanup) {
+  rm(hosp_dat)
+  rm(ccAllHosp)
+  rm(hospBeforeSpecimen_dat)
+  rm(hospAfterSpecimen_dat)
+  rm(hospBeforeAfterSpecimen_dat)
+
+}
+
+
+
+
+```
+
+
+```{r save combined dataset}
+
+
+
+
+## combined dataset to save
+save(sfp_use_dat, file = paste("Z:/epicell.folder/Omicron/BA2 DataLake/BA2_Rerun_Merged_", Sys.Date(), ".RData", sep = ""))
+
+
+
+```
+
+
+
