@@ -24,7 +24,7 @@ memory.limit(32*1024^2)
 
 #Packages to load
 
-packagesReqd <- c("rms", "tidyverse","ggridges","lubridate","flexsurv","flextable","survminer","sqldf","coxme", "readxl","fst","purrr","broom","glue")
+packagesReqd <- c("rms", "tidyverse","ggridges","lubridate","flexsurv","flextable","survminer","sqldf","coxme", "readxl","fst","purrr","broom","glue","cowplot")
 new.packages <- packagesReqd[!(packagesReqd %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages)
 invisible(lapply(packagesReqd, library, character.only = T, warn.conflicts = F, quietly = T))
@@ -811,9 +811,48 @@ save_as_docx(descriptive_ft, path = glue("{project}/Outputs/T1_descriptive_{Sys.
 rm(table1)
 rm(descriptive_ft)
 
+# Epicurve - Figure 1
+
+install.packages("ggforce")
+library(ggforce)
+
+epicurve <- incidence(voc, 
+                      date_index = specimen_date,
+                      groups = c("variantConfProbSGTF", "gen_type"),
+                      na_as_group = FALSE)
+
+epicurve_plot <- ggplot(epicurve %>%
+                          mutate(gen = factor(case_when(gen_type == "SGTF" ~ "S Gene status",
+                                                 gen_type == "SGTF + Genotyping" ~ "Genotyping & S Gene status",
+                                                 gen_type == "Validated sequencing" ~ "Validated sequencing",
+                                                 TRUE ~ "Unknown"), levels = c("S Gene status",
+                                                                               "Genotyping & S Gene status",
+                                                                               "Validated sequencing")
+                                              ),
+                                 variant = case_when(variantConfProbSGTF == "BA1" ~ "BA.1",
+                                                     variantConfProbSGTF == "BA2" ~ "BA.2"))) +
+  geom_col(aes(x = date_index, y = count, fill = gen, color = gen),
+           size = 0.25, width = 1) +
+  ggforce::facet_col(facets = vars(variant)) +
+  theme_ukhsa() +
+  scale_fill_manual(values=c("#b3ab93","#c9c9e2","#5484b4")) +
+  scale_color_manual(values=c("#9c9474","#949ccc","#30649f")) +
+  scale_x_date(breaks = "1 week", expand = c(0,0)) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.grid.major.y = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_blank()) +
+  labs(y = "Number of episodes",
+       x = "Week of specimen")
+  
+epicurve_plot
+
+ggsave(epicurve_plot,
+       filename = glue("figure1_{Sys.Date()}.jpeg"), device = "jpeg", path = glue("{project}/Outputs"), width = 23, height = 13,
+       units = "cm")
+
 ```
-
-
 
 
 Stratified Cox regression
@@ -979,7 +1018,7 @@ rm(death_l)
 
 ############################################
 #                                          #
-#          Figure 1: AGE  ANALYSIS         #
+#          Figure 2: AGE  ANALYSIS         #
 #                                          #
 ############################################
 
@@ -1002,6 +1041,27 @@ adm_age <- tibble::rownames_to_column(adm_age)  %>%
   filter(grepl("variant",rowname)) %>%
   mutate(outcome = "Admission")
 
+#test for interaction
+int_test_adm <- add1(
+  coxph( Surv(timeHospAdm2dLoS, HospAdm2dLoS=="Yes") ~ variantConfProbSGTF + 
+    strata(specimen_date_DAY) + 
+    strata(ageGrp10yr.Children5yo_10yr) + 
+    strata(vaccGp_6grp) +  
+    strata(nhser_name) + 
+    ageGrp10yr.Children5yo_10yr:age +
+    reinfection_status + 
+    sexHC + 
+    ethGrp4InclUnkn + 
+    imd_quintileGp + 
+    imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + ageGrp10yr.Children5yo_10yr:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_test_adm %>%
+  mutate(outcome = "Admission") %>%
+  rownames_to_column(var = "int_term")
+
 #Hospital attendance
 cxmod <- coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~ ageGrp10yr.Children5yo_10yr:I(1*(variantConfProbSGTF=="BA2")) + 
     strata(specimen_date_DAY) + 
@@ -1020,6 +1080,28 @@ att_age <- as.data.frame(att_age)
 att_age <- tibble::rownames_to_column(att_age)  %>%
    filter(grepl("variant",rowname)) %>%
   mutate(outcome = "Attendance")
+
+#test for interaction
+int_test_att <- add1(
+  coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~ variantConfProbSGTF + 
+    strata(specimen_date_DAY) + 
+    strata(ageGrp10yr.Children5yo_10yr) + 
+    strata(vaccGp_6grp) +  
+    strata(nhser_name) + 
+    ageGrp10yr.Children5yo_10yr:age +
+    reinfection_status + 
+    sexHC + 
+    ethGrp4InclUnkn + 
+    imd_quintileGp + 
+    imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + ageGrp10yr.Children5yo_10yr:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_test_att %>%
+  mutate(outcome = "Attendance") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test)
 
 #Died28
 cxmod <- coxph(Surv(timeDied28, died_28yn=="Yes") ~ ageGrp10yr:I(1*(variantConfProbSGTF=="BA2")) + 
@@ -1040,6 +1122,29 @@ death_age <- tibble::rownames_to_column(death_age)  %>%
    filter(grepl("variant",rowname)) %>%
   mutate(outcome = "Death")
 
+#test for interaction
+int_test_died <- add1(
+  coxph( Surv(timeDied28, died_28yn=="Yes") ~ variantConfProbSGTF + 
+    strata(specimen_date_DAY) + 
+    strata(ageGrp10yr) + 
+    strata(vaccGp_6grp) +  
+    strata(nhser_name) + 
+    ageGrp10yr:age +
+    reinfection_status + 
+    sexHC + 
+    ethGrp4InclUnkn + 
+    imd_quintileGp + 
+    imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + ageGrp10yr:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_test_died %>%
+  mutate(outcome = "Death") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test) %>%
+  select(outcome, `Pr(>Chi)`) %>%
+  filter(!is.na(`Pr(>Chi)`))
 
 # Join outcomes into a single table
 age_all <-rbind(adm_age,
@@ -1051,7 +1156,7 @@ rm(cxmod)
 rm(adm_age)
 rm(att_age)
 rm(death_age)
-
+rm(int_test_adm, int_test_att, int_test_died)
 
 # Make dataframe for HR plot
 figure2 <- 
@@ -1095,7 +1200,8 @@ figure2 <- figure2 %>%
           "All Ages")
       ),
     age.ypos = as.numeric(ageband),
-    outcome_f = factor(outcome) 
+    outcome_f = factor(outcome, levels = c("Attendance","Admission","Death"),
+                       labels = c("(A) Attendance", "(B) Admission", "(C) Death")) 
     ) 
 
 figure2 %>%
@@ -1134,7 +1240,7 @@ figure2 <- as_grouped_data(x = figure2, groups = c("outcome"))
  
 fig2_age_ft <- flextable(figure2, c("outcome", "ageband", "HR")) %>%
   
-  set_caption(caption = "Table 3: Hazard ratios of risk of severe outcomes in cases with BA2 compared to BA1, within different subgroups by vaccination, and reinfection status") %>%
+  set_caption(caption = glue("Figure 2: Hazard ratios of risk of severe outcomes in cases with BA2 compared to BA1, within different subgroups by age group")) %>%
  
   compose(j = "HR",
           value = as_paragraph(as_chunk(sprintf("%.2f",`V1`)), as_chunk(" ("), as_chunk(sprintf("%.2f",`2.5 %`)), as_chunk(" - "), as_chunk(sprintf("%.2f",`97.5 %`)), as_chunk(")")
@@ -1147,7 +1253,9 @@ fig2_age_ft <- flextable(figure2, c("outcome", "ageband", "HR")) %>%
   merge_at(i = 1:1, j = 1:3) %>%
   merge_at(i = 13:13, j = 1:3) %>%
   merge_at(i = 25:25, j = 1:3)
- 
+
+int_ft <- flextable(int_test)  
+save_as_docx(int_ft, path = glue("{project}/Outputs/F2_pvals_{Sys.Date()}.docx"))
   
 #print(fig2_age_ft, preview = "docx")
 
@@ -1161,7 +1269,7 @@ save_as_docx(fig2_age_ft, path = glue("{project}/Outputs/S1_age_backingdata_{Sys
 
 ########################################################
 #                                                      #
-#   TABLE 3: REINFECTION & VACCINATION ANALYSIS        #
+#   TABLE 2: REINFECTION & VACCINATION ANALYSIS        #
 #                                                      #
 ########################################################
 
@@ -1192,6 +1300,27 @@ vacc_adm <- vacc_adm %>%
   filter(grepl("vaccGp_4grp", rowname))
 vacc_adm
 
+#test for interaction
+int_adm <- add1(
+  coxph( Surv(timeHospAdm2dLoS, HospAdm2dLoS=="Yes") ~ variantConfProbSGTF +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr.Children5yo_10yr) + 
+              strata(vaccGp_4grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr.Children5yo_10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + vaccGp_4grp:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_adm %>%
+  mutate(outcome = "Admission") %>%
+  rownames_to_column(var = "int_term") 
+
 ## Attendance - by vaccination status
 cxmod <- coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~  vaccGp_4grp:I(1*(variantConfProbSGTF=="BA2")) +
               strata(specimen_date_DAY) +
@@ -1216,6 +1345,28 @@ vacc_att <- tibble::rownames_to_column(vacc_att)
 vacc_att <- vacc_att %>%
   filter(grepl("vaccGp_4grp", rowname))
 vacc_att
+
+#test for interaction
+int_att <- add1(
+  coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~ variantConfProbSGTF +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr.Children5yo_10yr) + 
+              strata(vaccGp_4grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr.Children5yo_10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + vaccGp_4grp:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_att %>%
+  mutate(outcome = "Attendance") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test) 
 
 # Died within 28 days - by vaccination status
 cxmod <- coxph( Surv(timeDied28, died_28yn=="Yes") ~  vaccGp_4grp:I(1*(variantConfProbSGTF=="BA2")) +
@@ -1243,9 +1394,37 @@ vacc_died <- tibble::rownames_to_column(vacc_died)
 vacc_died <- vacc_died %>%
   filter(grepl("vaccGp_4grp", rowname))
 
+
+#test for interaction
+int_died <- add1(
+  coxph( Surv(timeDied28, died_28yn=="Yes") ~  variantConfProbSGTF +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr) + 
+              strata(vaccGp_4grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + vaccGp_4grp:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_died %>%
+  mutate(outcome = "Death") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test) %>%
+  select(outcome, `Pr(>Chi)`) %>%
+  filter(!is.na(`Pr(>Chi)`))
+
+int_ft <- flextable(int_test)  
+save_as_docx(int_ft, path = glue("{project}/Outputs/T2_pvals_{Sys.Date()}.docx"))
+
 # Join outcomes into a single table
-vacc_all <-left_join(vacc_adm,
-                    vacc_att,
+vacc_all <-left_join(vacc_att,
+                    vacc_adm,
     by = "rowname") 
 vacc_all <-left_join(vacc_all,
                     vacc_died,
@@ -1255,11 +1434,11 @@ vacc_all <- vacc_all %>%
   mutate(v_status = case_when(
     (grepl("Unvaccinated",rowname)) ~ "Unvaccinated/<28d after first dose",
     #(grepl("<28d after first dose",rowname)) ~  "<28d after first dose",
-    (grepl(">=28d after first dose",rowname)) ~  ">=28d after first dose",
+    (grepl(">=28d after first dose",rowname)) ~  "\u2265 28d after first dose",
     #(grepl(">=14d after second dose",rowname)) ~  ">=14d after second dose", 
-    (grepl(">=14d after second dose",rowname)) ~  ">=14d after second dose",
+    (grepl(">=14d after second dose",rowname)) ~  "\u2265 14d after second dose",
     #(grepl(">=7d after third dose",rowname)) ~  ">=7d after third dose",
-    (grepl(">=14d after third dose",rowname)) ~  ">=14d after third dose")
+    (grepl(">=14d after third dose",rowname)) ~  "\u2265 14d after third dose")
     ) %>%
   select(-c("rowname"))
   
@@ -1269,7 +1448,7 @@ rm(cxmod)
 rm(vacc_adm)
 rm(vacc_att)
 rm(vacc_died)
-
+rm(int_att, int_adm, int_died)
 ## Hospital admission - by reinfection status
 cxmod <- coxph( Surv(timeHospAdm2dLoS, HospAdm2dLoS=="Yes") ~ reinfection_status + reinfection_status:I(1*(variantConfProbSGTF=="BA2")) +
                   strata(specimen_date_DAY) +
@@ -1292,6 +1471,26 @@ reinf_adm <- tibble::rownames_to_column(reinf_adm)
 reinf_adm <- reinf_adm %>%
   filter(grepl("variant", rowname))
 reinf_adm
+
+#test for interaction
+int_adm <- add1(
+  coxph( Surv(timeHospAdm2dLoS, HospAdm2dLoS=="Yes") ~ reinfection_status + variantConfProbSGTF +
+                  strata(specimen_date_DAY) +
+                  strata(ageGrp10yr.Children5yo_10yr) + 
+                  strata(vaccGp_6grp) +  
+                  strata(nhser_name) + 
+                  ageGrp10yr.Children5yo_10yr:age +
+                  sexHC + 
+                  ethGrp4InclUnkn + 
+                  imd_quintileGp + 
+                  imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + reinfection_status:variantConfProbSGTF, test="Chisq")
+
+int_test_reinf <- int_adm %>%
+  mutate(outcome = "Admission") %>%
+  rownames_to_column(var = "int_term") 
 
 ## Attendance - by reinfection status
 cxmod <- coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~  reinfection_status + reinfection_status:I(1*(variantConfProbSGTF=="BA2")) +
@@ -1316,6 +1515,27 @@ reinf_att <- reinf_att %>%
   filter(grepl("variant", rowname))
 reinf_att
 
+#test for interaction
+int_att <- add1(
+  coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~ reinfection_status + variantConfProbSGTF +
+                  strata(specimen_date_DAY) +
+                  strata(ageGrp10yr.Children5yo_10yr) + 
+                  strata(vaccGp_6grp) +  
+                  strata(nhser_name) + 
+                  ageGrp10yr.Children5yo_10yr:age +
+                  sexHC + 
+                  ethGrp4InclUnkn + 
+                  imd_quintileGp + 
+                  imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + reinfection_status:variantConfProbSGTF, test="Chisq")
+
+int_test_reinf <- int_att %>%
+  mutate(outcome = "Attendance") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test_reinf) 
+
 # Died within 28 days - by reinfection status
 cxmod <- coxph( Surv(timeDied28, died_28yn=="Yes") ~  reinfection_status + reinfection_status:I(1*(variantConfProbSGTF=="BA2")) +
                   strata(specimen_date_DAY) +
@@ -1339,9 +1559,37 @@ reinf_died <- reinf_died %>%
   filter(grepl("variant", rowname))
 reinf_died
 
+#test for interaction
+int_died <- add1(
+  coxph( Surv(timeDied28, died_28yn=="Yes") ~  reinfection_status + variantConfProbSGTF +
+                  strata(specimen_date_DAY) +
+                  strata(ageGrp10yr) + 
+                  strata(vaccGp_6grp) +  
+                  strata(nhser_name) + 
+                  ageGrp10yr:age +
+                  sexHC + 
+                  ethGrp4InclUnkn + 
+                  imd_quintileGp + 
+                  imd_quintileGp:imd_rankNUM,     
+    data = voc
+),
+scope= . ~ . + reinfection_status:variantConfProbSGTF, test="Chisq")
+
+int_test_reinf <- int_died %>%
+  mutate(outcome = "Death") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test_reinf) %>%
+  select(outcome, `Pr(>Chi)`) %>%
+  filter(!is.na(`Pr(>Chi)`))
+
+int_ft <- flextable(int_test_reinf)  
+save_as_docx(int_ft, path = glue("{project}/Outputs/T2_pvals_reinf_{Sys.Date()}.docx"))
+
+
+
 # Combine all outcomes into single table
-reinf_all <-left_join(reinf_adm,
-                     reinf_att,
+reinf_all <-left_join(reinf_att,
+                     reinf_adm,
                      by = "rowname") 
 reinf_all <-left_join(reinf_all,
                      reinf_died,
@@ -1371,20 +1619,20 @@ vacc_reinfection <- vacc_reinfection %>%
 
 vacc_reinfection <- as_grouped_data(x = vacc_reinfection, groups = c("group"))
   
-rm(vacc_all)
-rm(reinf_all)
+#rm(vacc_all)
+#rm(reinf_all)
 
 #Create reinfection vaccination flextable
 vacc_reinfection_ft <- flextable(vacc_reinfection, c("group","v_status", "adm","att","died")) %>%
   
   set_caption(caption = "Table 3: Hazard ratios of risk of severe outcomes in cases with BA2 compared to BA1, within different subgroups by vaccination, and reinfection status") %>%
- 
-  compose(j = "adm",
-          value = as_paragraph(as_chunk(sprintf("%.2f",`HR_adm`)), as_chunk(" ("), as_chunk(sprintf("%.2f",`2.5 %_adm`)), as_chunk(" - "), as_chunk(sprintf("%.2f",`97.5 %_adm`)), as_chunk(")")
-          )) %>%
 
   compose(j = "att",
           value = as_paragraph(as_chunk(sprintf("%.2f",`HR_att`)), as_chunk(" ("), as_chunk(sprintf("%.2f",`2.5 %_att`)), as_chunk(" - "), as_chunk(sprintf("%.2f",`97.5 %_att`)), as_chunk(")")
+          )) %>%
+ 
+  compose(j = "adm",
+          value = as_paragraph(as_chunk(sprintf("%.2f",`HR_adm`)), as_chunk(" ("), as_chunk(sprintf("%.2f",`2.5 %_adm`)), as_chunk(" - "), as_chunk(sprintf("%.2f",`97.5 %_adm`)), as_chunk(")")
           )) %>%
 
   compose(j = "died",
@@ -1406,6 +1654,86 @@ set_table_properties(layout = "autofit") %>%
 print(vacc_reinfection_ft, preview = "docx")
 
 save_as_docx(vacc_reinfection_ft, path = glue("{project}/Outputs/T3_vaccination_reinfection_{Sys.Date()}.docx"))
+
+# Make dataframe for HR plot
+figure3_vacc <- 
+  vacc_all %>%
+  pivot_longer(cols = ends_with(c("adm","att","died"))) %>%
+  mutate(outcome = factor(case_when(grepl("adm",name) ~ "Admission",
+                             grepl("att",name) ~ "Attendance",
+                             grepl("died",name) ~ "Death"), 
+                          levels = c("Attendance","Admission","Death")),
+         name = case_when(grepl("HR",name) ~ "hr",
+                             grepl("2.5",name) ~ "lowerci",
+                             grepl("97.5",name) ~ "upperci")) %>%
+  pivot_wider(names_from = name, values_from = value) %>%
+  mutate(v_status = factor(v_status, levels = c("\u2265 14d after third dose",                                              
+                                                "\u2265 14d after second dose",
+                                                "\u2265 28d after first dose",
+                                                "Unvaccinated/<28d after first dose"
+                                              )))
+  
+
+figure3_vacc_fg <- figure3_vacc %>%
+  ggplot() + 
+  geom_pointrange(aes(x=hr,xmin=lowerci,xmax=upperci,y=v_status), position=position_dodge(width=.4), colour="#56B4E9")  +
+  scale_y_discrete(name=NULL, guide = guide_axis(angle = 0) ) +
+  scale_x_continuous(name="Hazard ratio (compared to BA1)", breaks=seq(.2,4,by=.2), limits = c(0.0, 2.0),
+                     guide = guide_axis(angle = 45)  ) + 
+  labs(color=NULL ) + 
+  theme_classic() + theme(legend.title=element_blank())  +
+  theme(panel.grid.major = element_line(colour="lightgrey",linetype="dashed", size = 0.1),strip.background =  element_blank()) +
+  facet_wrap(~outcome, dir = "v") +
+  geom_vline(xintercept=1, linetype="solid", color = "black", size=0.5) +
+  theme(
+    axis.text = element_text(size = 10),  
+    axis.title = element_text(size = 11),
+    axis.title.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank())
+
+figure3_vacc_fg
+
+figure3_reinf <- 
+  reinf_all %>%
+  pivot_longer(cols = ends_with(c("adm","att","died"))) %>%
+  mutate(outcome = factor(case_when(grepl("adm",name) ~ "Admission",
+                             grepl("att",name) ~ "Attendance",
+                             grepl("died",name) ~ "Death"), 
+                          levels = c("Attendance","Admission","Death")),
+         name = case_when(grepl("HR",name) ~ "hr",
+                             grepl("2.5",name) ~ "lowerci",
+                             grepl("97.5",name) ~ "upperci"),
+         v_status = factor(v_status, levels = c("Reinfection", "First infection"))) %>%
+  pivot_wider(names_from = name, values_from = value)
+
+figure3_reinf_fg <- figure3_reinf %>%
+  ggplot() + 
+  geom_pointrange(aes(x=hr,xmin=lowerci,xmax=upperci,y=v_status), position=position_dodge(width=.4), colour="#56B4E9")  +
+  scale_y_discrete(name=NULL, guide = guide_axis(angle = 0) ) +
+  scale_x_continuous(name="Hazard ratio (compared to BA1)", breaks=seq(.2,4,by=.2), limits = c(0.0, 2.0), 
+                     guide = guide_axis(angle = 45)  ) + 
+  labs(color=NULL ) + 
+  theme_classic() + theme(legend.title=element_blank())  +
+  theme(panel.grid.major = element_line(colour="lightgrey",linetype="dashed", size = 0.1),strip.background =  element_blank()) +
+  facet_wrap(~outcome, dir = "v") +
+  geom_vline(xintercept=1, linetype="solid", color = "black", size=0.5) +
+  theme(
+    axis.text = element_text(size = 10),  
+    axis.title = element_text(size = 11))
+
+figure3_reinf_fg
+
+p <- plot_grid(figure3_vacc_fg, figure3_reinf_fg, align = c("hv"),
+               ncol = 1,
+               labels = c('A', 'B'), label_size = 12)
+
+ggdraw(p)
+
+#Export graph
+ggsave(p, filename = glue("figure3_vacc_{Sys.Date()}.jpeg"), device = "jpeg", path = glue("{project}/Outputs"), width = 30, height = 20,
+       units = "cm")
 
 
 
@@ -1689,5 +2017,336 @@ print(sens_outcome_ft, preview = "docx")
 
 save_as_docx(sens_outcome_ft, path = glue("{project}/Outputs/SX_alternative_adj_outcomes_{Sys.Date()}.docx"))
 
+##########################################################################################
+#                                                                                        #
+#                         sensitivity ANALYSES: Testing Period                           #
+#                                                                                        #
+##########################################################################################
 
+## Flag for different time periods
+voc_period <- voc %>%
+  mutate(test_period = case_when(between(specimen_date, as.Date("2021-12-01"), as.Date("2022-01-10")) ~ "01Dec_10Jan",
+                                 between(specimen_date, as.Date("2022-01-11"), as.Date("2022-02-20")) ~ "11Jan_20Feb",
+                                 between(specimen_date, as.Date("2022-02-21"), as.Date("2022-03-31")) ~ "21Feb_31Mar",
+                                 TRUE ~ "Unknown"))
+                                 
+
+## Hospital admission - by test period
+cxmod <- coxph( Surv(timeHospAdm2dLoS, HospAdm2dLoS=="Yes") ~ test_period:I(1*(variantConfProbSGTF=="BA2")) +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr.Children5yo_10yr) + 
+              strata(vaccGp_4grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr.Children5yo_10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM, 
+         data = voc_period
+    )
+
+testp_adm <- cbind(exp(coef(cxmod)),exp(confint(cxmod)))
+testp_adm
+
+testp_adm <- as.data.frame(testp_adm) %>%
+  rename(HR_adm = V1, 
+         `2.5 %_adm` = `2.5 %`,
+         `97.5 %_adm` = `97.5 %`) 
+testp_adm <- tibble::rownames_to_column(testp_adm)
+testp_adm <- testp_adm %>%
+  filter(grepl("test_period", rowname))
+
+## Attendance - by test period
+cxmod <- coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~ test_period:I(1*(variantConfProbSGTF=="BA2")) +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr.Children5yo_10yr) + 
+              strata(vaccGp_4grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr.Children5yo_10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM, 
+         data = voc_period
+    )
+
+testp_att <- cbind(exp(coef(cxmod)),exp(confint(cxmod)))
+testp_att
+
+testp_att <- as.data.frame(testp_att) %>%
+  rename(HR_att = V1, 
+         `2.5 %_att` = `2.5 %`,
+         `97.5 %_att` = `97.5 %`) 
+testp_att <- tibble::rownames_to_column(testp_att)
+testp_att <- testp_att %>%
+  filter(grepl("test_period", rowname))
+
+# Died within 28 days - by test period
+cxmod <- coxph( Surv(timeDied28, died_28yn=="Yes") ~ test_period:I(1*(variantConfProbSGTF=="BA2")) +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr) + 
+              strata(vaccGp_4grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM, 
+         data = voc_period
+    )
+
+testp_died <- cbind(exp(coef(cxmod)),exp(confint(cxmod)))
+
+testp_died <- as.data.frame(testp_died) %>%
+  rename(HR_died = V1, 
+         `2.5 %_died` = `2.5 %`,
+         `97.5 %_died` = `97.5 %`) 
+testp_died <- tibble::rownames_to_column(testp_died)
+testp_died <- testp_died %>%
+  filter(grepl("test_period", rowname))
+
+
+# Join outcomes into a single table
+testp_all <-left_join(testp_att,
+                      testp_adm,
+    by = "rowname") 
+testp_all <- left_join(testp_all,
+                    testp_died,
+    by = "rowname") 
+
+testp_all <- testp_all %>%
+  mutate(test_period = case_when(
+    (grepl("01Dec",rowname)) ~ "01 December 2021 - 10 January 2022",
+    (grepl("11Jan",rowname)) ~  "11 January 2022 - 20 February 2022",
+    (grepl("21Feb",rowname)) ~  "21 February 2022 - 31 March 2022")
+    ) %>%
+  select(-c("rowname")) %>%
+  relocate(test_period)
+  
+# Flextable
+ 
+testp_ft <- flextable(testp_all, c("test_period", "att","adm","died")) %>%
+  
+  set_caption(caption = "Supplementary Table: Hazard ratios of risk of severe outcomes in cases with BA2 compared to BA1, within different subgroups by testing periods") %>%
+
+  compose(j = "att",
+          value = as_paragraph(as_chunk(sprintf("%.2f",`HR_att`)), as_chunk(" ("), as_chunk(sprintf("%.2f",`2.5 %_att`)), as_chunk(" - "), as_chunk(sprintf("%.2f",`97.5 %_att`)), as_chunk(")")
+          )) %>%
+  
+  compose(j = "adm",
+          value = as_paragraph(as_chunk(sprintf("%.2f",`HR_adm`)), as_chunk(" ("), as_chunk(sprintf("%.2f",`2.5 %_adm`)), as_chunk(" - "), as_chunk(sprintf("%.2f",`97.5 %_adm`)), as_chunk(")")
+          )) %>%
+
+  compose(j = "died",
+          value = as_paragraph(as_chunk(sprintf("%.2f",`HR_died`)), as_chunk(" ("), as_chunk(sprintf("%.2f",`2.5 %_died`)), as_chunk(" - "), as_chunk(sprintf("%.2f",`97.5 %_died`)), as_chunk(")")
+          )) %>%
+
+set_table_properties(layout = "autofit") %>%  
+  
+    set_header_labels(
+                    "test_period" = "Sub-group",
+                    "att" = "Any hospital attendance (including admission) up to 14 days after positive test", 
+                    "adm"  = "Hospital admission up to 14 days after positive test, > 1 day length of stay", 
+                    "died"      = "Death within 28 days after positive test") 
+testp_ft
+
+save_as_docx(testp_ft, path = glue("{project}/Outputs/SX_testing_period_{Sys.Date()}.docx"))
+
+
+#test for interaction
+int_adm <- add1(
+  coxph( Surv(timeHospAdm2dLoS, HospAdm2dLoS=="Yes") ~ variantConfProbSGTF +
+                  strata(specimen_date_DAY) +
+                  strata(ageGrp10yr.Children5yo_10yr) + 
+                  strata(vaccGp_6grp) +  
+                  strata(nhser_name) + 
+                  ageGrp10yr.Children5yo_10yr:age +
+                  sexHC + 
+                  ethGrp4InclUnkn + 
+                  imd_quintileGp + 
+                  imd_quintileGp:imd_rankNUM,     
+    data = voc_period
+),
+scope= . ~ . + test_period:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_adm %>%
+  mutate(outcome = "Admission") %>%
+  rownames_to_column(var = "int_term") 
+
+#test for interaction
+int_att <- add1(
+  coxph( Surv(timeAttendanceHosp, AttendanceHosp=="Yes") ~ variantConfProbSGTF +
+                  strata(specimen_date_DAY) +
+                  strata(ageGrp10yr.Children5yo_10yr) + 
+                  strata(vaccGp_6grp) +  
+                  strata(nhser_name) + 
+                  ageGrp10yr.Children5yo_10yr:age +
+                  sexHC + 
+                  ethGrp4InclUnkn + 
+                  imd_quintileGp + 
+                  imd_quintileGp:imd_rankNUM,     
+    data = voc_period
+),
+scope= . ~ . + test_period:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_att %>%
+  mutate(outcome = "Attendance") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test) 
+
+#test for interaction
+int_died <- add1(
+  coxph( Surv(timeDied28, died_28yn=="Yes") ~ variantConfProbSGTF +
+                  strata(specimen_date_DAY) +
+                  strata(ageGrp10yr) + 
+                  strata(vaccGp_6grp) +  
+                  strata(nhser_name) + 
+                  ageGrp10yr:age +
+                  sexHC + 
+                  ethGrp4InclUnkn + 
+                  imd_quintileGp + 
+                  imd_quintileGp:imd_rankNUM,     
+    data = voc_period
+),
+scope= . ~ . + test_period:variantConfProbSGTF, test="Chisq")
+
+int_test <- int_died %>%
+  mutate(outcome = "Death") %>%
+  rownames_to_column(var = "int_term") %>%
+  rbind(int_test) %>%
+  select(outcome, `Pr(>Chi)`) %>%
+  filter(!is.na(`Pr(>Chi)`))
+
+int_ft <- flextable(int_test)  
+
+save_as_docx(int_ft, path = glue("{project}/Outputs/SX_pvals_testing_periods_{Sys.Date()}.docx"))
+
+##########################################################################################
+#                                                                                        #
+#                 sensitivity ANALYSES: Restricted time period                           #
+#                                                                                        #
+##########################################################################################
+
+## Restrict to 14 February 2022 - 27 February 2022
+voc_restricted <- voc %>%
+  filter(between(specimen_date, as.Date("2022-02-14"), as.Date("2022-02-27")))      
+
+fl <- list("Surv(timeHospAdm2dLoS, HospAdm2dLoS=='Yes')",
+            "Surv(timeAttendanceHosp,AttendanceHosp=='Yes')")
+
+models <- map(.x = fl, 
+              .f = ~coxph(as.formula(glue::glue("{.x} ~ variantConfProbSGTF +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr.Children5yo_10yr) + 
+              strata(vaccGp_6grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr.Children5yo_10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM")), 
+                          data = voc, control = coxph.control()))
+models_df <- map_dfr(.x = models, .f = tidy, exponentiate = TRUE, conf.int = TRUE)
+models_df <- models_df %>%
+  filter(grepl("variant", term))
+models_df$formula <- as.character(fl)
+models_df$dataset <- "All observations"
+
+models <- map(.x = fl, 
+              .f = ~coxph(as.formula(glue::glue("{.x} ~ variantConfProbSGTF +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr.Children5yo_10yr) + 
+              strata(vaccGp_6grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr.Children5yo_10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM")), 
+                          data = voc_restricted, control = coxph.control()))
+models_rest_df <- map_dfr(.x = models, .f = tidy, exponentiate = TRUE, conf.int = TRUE)
+models_rest_df <- models_rest_df %>%
+  filter(grepl("variant", term))
+models_rest_df$formula <- as.character(fl)
+models_rest_df$dataset <- "Restricted to 14 February - 27 February 2022"
+
+models_df <- models_df %>% rbind(models_rest_df)
+
+
+fl <- list("Surv(timeDied28, died_28yn=='Yes')")
+models <- map(.x = fl, 
+              .f = ~coxph(as.formula(glue::glue("{.x} ~ variantConfProbSGTF +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr) + 
+              strata(vaccGp_6grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM")), 
+                          data = voc, control = coxph.control()))
+models_df2 <- map_dfr(.x = models, .f = tidy, exponentiate = TRUE, conf.int = TRUE)
+models_df2 <- models_df2 %>%
+  filter(grepl("variant", term))
+models_df2$formula <- as.character(fl)
+models_df2$dataset <- "All observations"
+
+models <- map(.x = fl, 
+              .f = ~coxph(as.formula(glue::glue("{.x} ~ variantConfProbSGTF +
+              strata(specimen_date_DAY) +
+              strata(ageGrp10yr) + 
+              strata(vaccGp_6grp) +  
+              strata(nhser_name) + 
+              ageGrp10yr:age +
+              reinfection_status + 
+              sexHC + 
+              ethGrp4InclUnkn + 
+              imd_quintileGp + 
+              imd_quintileGp:imd_rankNUM")), 
+                          data = voc_restricted, control = coxph.control()))
+models_rest_df2 <- map_dfr(.x = models, .f = tidy, exponentiate = TRUE, conf.int = TRUE)
+models_rest_df2 <- models_rest_df2 %>%
+  filter(grepl("variant", term))
+models_rest_df2$formula <- as.character(fl)
+models_rest_df2$dataset <- "Restricted to 14 February - 27 February 2022"
+
+models_df2 <- models_df2 %>% rbind(models_rest_df2)
+
+## Append death outcomes onto other two
+
+sens_restrict <- models_df %>%
+ rbind(models_df2) %>%
+  mutate(
+    outcome = factor(case_when(
+      grepl("Adm", formula) ~ "Admission",
+      grepl("Attendance", formula) ~ "Attendance",
+      grepl("Died", formula) ~ "Death"
+    ), levels = c("Attendance","Admission","Death")),
+    estimates = glue("{format(estimate, digits = 2)} ({format(conf.low, digits = 2)} - {format(conf.high, digits = 2)})")
+  ) %>%
+  arrange(outcome) %>%
+  select(dataset, estimates, outcome) %>% 
+  pivot_wider(id_cols = dataset, names_from = outcome, values_from = estimates)
+
+## Flextable
+
+sens_restrict_ft <- sens_restrict %>% 
+  flextable() %>% 
+  set_header_labels(dataset = "", 
+                    Attendance = "Any hospital attendance (including admission) up to 14 days after positive test", 
+                    Admission = "Hospital admission up to 14 days after positive test", 
+                    Death = "Death within 28 days after positive test") %>% 
+  add_header_row(values = c("", "HR (95% confidence interval)"), 
+                 colwidths = c(1,3)) %>% 
+  autofit() %>% 
+  align(i = 1, align = "center", part = "header")
+
+save_as_docx(sens_restrict_ft, path = glue("{project}/Outputs/SX_restricted_time_period_{Sys.Date()}.docx"))
 ```
